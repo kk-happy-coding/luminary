@@ -10,6 +10,8 @@ services:
     volumes:
       # :z sets the SELinux label so Podman can access the host path
       - ./app:/app/app:z
+      - ./data:/app/data:z
     environment:
       - PYTHONUNBUFFERED=1
+      - LUMINARY_DATA_DIR=/app/data
     restart: unless-stopped

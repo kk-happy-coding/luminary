@@ -22,4 +22,4 @@ def test_api_info():
     assert response.status_code == 200
     data = response.json()
     assert data["message"] == "Hello World"
-    assert data["version"] == "0.1.0"
+    assert data["version"] == "0.2.0"

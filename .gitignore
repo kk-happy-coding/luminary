@@ -1,0 +1,18 @@
+# System / shell
+.bash_history
+.bashrc
+.profile
+.lesshst
+.viminfo
+
+# SSH / credentials
+.ssh/
+
+# App data
+.claude/
+.claude.json
+.claude.json.backup.*
+.config/
+.npm/
+.vnc/
+.vscode/

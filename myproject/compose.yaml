@@ -1,0 +1,13 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Containerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      # :z sets the SELinux label so Podman can access the host path
+      - ./app:/app/app:z
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped

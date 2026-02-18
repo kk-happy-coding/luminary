@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-FastAPI web application developed inside a **Podman pod** via `podman-compose`.
+**Luminary** — FastAPI web application with an aurora-animated SPA frontend, developed inside a **Podman pod** via `podman-compose`.
 
 ## Dev Environment (Podman)
 
@@ -33,7 +33,7 @@ podman-compose exec api ruff check app/ --fix           # Auto-fix lint issues
 ## Architecture
 
 ```
-myproject/
+luminary/   (directory: myproject/)
 ├── app/
 │   └── main.py          # FastAPI app instance and routes
 ├── tests/

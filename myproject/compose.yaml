@@ -1,3 +1,5 @@
+name: luminary
+
 services:
   api:
     build:

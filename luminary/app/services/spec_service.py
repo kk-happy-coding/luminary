@@ -1,5 +1,7 @@
+import asyncio
 import json
 from datetime import datetime, timezone
+from urllib.parse import urljoin
 
 import httpx
 import yaml
@@ -11,9 +13,129 @@ from app.models import (
     ParameterInfo,
 )
 
+HTTP_METHODS = frozenset(
+    ["get", "post", "put", "patch", "delete", "head", "options", "trace"]
+)
 
-def _resolve_ref(ref: str, spec: dict) -> dict:
-    """Resolve a simple $ref like '#/components/schemas/Foo' one level deep."""
+
+# ─── External $ref fetching ───────────────────────────────────────────────────
+
+async def _fetch_external(
+    url: str,
+    http_client: httpx.AsyncClient,
+    sem: asyncio.Semaphore,
+    cache: dict[str, dict],
+) -> dict:
+    if url in cache:
+        return cache[url]
+    async with sem:
+        try:
+            resp = await http_client.get(url, follow_redirects=True, timeout=30.0)
+            resp.raise_for_status()
+        except Exception:
+            cache[url] = {}
+            return {}
+        is_yaml = (
+            "yaml" in resp.headers.get("content-type", "")
+            or url.endswith(".yaml")
+            or url.endswith(".yml")
+        )
+        try:
+            parsed = yaml.safe_load(resp.text) if is_yaml else json.loads(resp.text)
+            result = parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            result = {}
+        cache[url] = result
+        return result
+
+
+async def _resolve_external_path_items(
+    spec: dict,
+    spec_url: str,
+    http_client: httpx.AsyncClient,
+) -> None:
+    """
+    Fetch external path-item $refs concurrently, then inline their parameter $refs.
+    Mutates spec["paths"] in-place.
+    """
+    paths = spec.get("paths", {})
+    cache: dict[str, dict] = {}
+    sem = asyncio.Semaphore(30)
+
+    # Base dir of the spec file (for resolving relative refs)
+    spec_base = spec_url.rsplit("/", 1)[0] + "/"
+
+    # Phase 1: collect external path-item refs
+    external: dict[str, str] = {}  # path → absolute URL
+    for path, path_item in paths.items():
+        if (
+            isinstance(path_item, dict)
+            and list(path_item.keys()) == ["$ref"]
+            and not path_item["$ref"].startswith("#")
+        ):
+            external[path] = urljoin(spec_base, path_item["$ref"])
+
+    if not external:
+        return
+
+    # Phase 2: fetch all path-item files concurrently
+    items: dict[str, tuple[dict, str]] = {}  # path → (doc, file_url)
+
+    async def _fetch_path_item(path: str, url: str) -> None:
+        doc = await _fetch_external(url, http_client, sem, cache)
+        items[path] = (doc, url)
+
+    await asyncio.gather(*[_fetch_path_item(p, u) for p, u in external.items()])
+
+    # Phase 3: collect all parameter $refs (relative to their path-item file)
+    param_urls: set[str] = set()
+    for _path, (doc, file_url) in items.items():
+        if not doc:
+            continue
+        file_base = file_url.rsplit("/", 1)[0] + "/"
+        for method in HTTP_METHODS:
+            op = doc.get(method)
+            if not isinstance(op, dict):
+                continue
+            for param in op.get("parameters", []):
+                if isinstance(param, dict) and "$ref" in param:
+                    ref = param["$ref"]
+                    if not ref.startswith("#"):
+                        param_urls.add(urljoin(file_base, ref))
+
+    # Phase 4: fetch all parameter files concurrently
+    if param_urls:
+        await asyncio.gather(
+            *[_fetch_external(u, http_client, sem, cache) for u in param_urls]
+        )
+
+    # Phase 5: inline path items, resolving their parameter refs
+    for path, (doc, file_url) in items.items():
+        if not doc:
+            continue
+        file_base = file_url.rsplit("/", 1)[0] + "/"
+        for method in HTTP_METHODS:
+            op = doc.get(method)
+            if not isinstance(op, dict):
+                continue
+            inlined_params = []
+            for param in op.get("parameters", []):
+                if isinstance(param, dict) and "$ref" in param:
+                    ref = param["$ref"]
+                    if not ref.startswith("#"):
+                        resolved = cache.get(urljoin(file_base, ref), param)
+                        inlined_params.append(resolved)
+                    else:
+                        inlined_params.append(param)
+                else:
+                    inlined_params.append(param)
+            op["parameters"] = inlined_params
+        paths[path] = doc
+
+
+# ─── Internal $ref resolution (single-document) ──────────────────────────────
+
+def _resolve_internal_ref(ref: str, spec: dict) -> dict:
     if not ref.startswith("#/"):
         return {}
     parts = ref.lstrip("#/").split("/")
@@ -27,17 +149,23 @@ def _resolve_ref(ref: str, spec: dict) -> dict:
 
 def _resolve_schema(schema: dict, spec: dict) -> dict:
     if "$ref" in schema:
-        return _resolve_ref(schema["$ref"], spec)
+        return _resolve_internal_ref(schema["$ref"], spec)
     return schema
 
 
-def _extract_parameters(operation: dict, path_item: dict, spec: dict) -> list[ParameterInfo]:
-    raw_params: list[dict] = list(path_item.get("parameters", []))
-    raw_params.extend(operation.get("parameters", []))
+# ─── Endpoint flattening ─────────────────────────────────────────────────────
+
+def _extract_parameters(
+    operation: dict, path_item: dict, spec: dict
+) -> list[ParameterInfo]:
+    raw: list[dict] = list(path_item.get("parameters", []))
+    raw.extend(operation.get("parameters", []))
     params = []
-    for p in raw_params:
+    for p in raw:
+        if not isinstance(p, dict):
+            continue
         if "$ref" in p:
-            p = _resolve_ref(p["$ref"], spec)
+            p = _resolve_internal_ref(p["$ref"], spec)
         if not p:
             continue
         schema = _resolve_schema(p.get("schema", {}), spec)
@@ -60,13 +188,18 @@ def _extract_request_body(
     if rb is None:
         return False, None, False
     if "$ref" in rb:
-        rb = _resolve_ref(rb["$ref"], spec)
+        rb = _resolve_internal_ref(rb["$ref"], spec)
     required = rb.get("required", False)
     content = rb.get("content", {})
-    for media_type in ("application/json", "application/x-www-form-urlencoded", "multipart/form-data"):
+    for media_type in (
+        "application/json",
+        "application/x-www-form-urlencoded",
+        "multipart/form-data",
+    ):
         if media_type in content:
-            schema = content[media_type].get("schema", {})
-            schema = _resolve_schema(schema, spec)
+            schema = _resolve_schema(
+                content[media_type].get("schema", {}), spec
+            )
             return True, schema, required
     return True, None, required
 
@@ -74,20 +207,18 @@ def _extract_request_body(
 def _flatten_endpoints(spec: dict) -> list[EndpointSummary]:
     paths = spec.get("paths", {})
     endpoints = []
-    http_methods = {"get", "post", "put", "patch", "delete", "head", "options", "trace"}
-
     for path, path_item in paths.items():
         if not isinstance(path_item, dict):
             continue
         for method, operation in path_item.items():
-            if method.lower() not in http_methods:
+            if method.lower() not in HTTP_METHODS:
                 continue
             if not isinstance(operation, dict):
                 continue
-
             parameters = _extract_parameters(operation, path_item, spec)
-            has_body, body_schema, body_required = _extract_request_body(operation, spec)
-
+            has_body, body_schema, body_required = _extract_request_body(
+                operation, spec
+            )
             endpoints.append(
                 EndpointSummary(
                     method=method.upper(),
@@ -105,27 +236,23 @@ def _flatten_endpoints(spec: dict) -> list[EndpointSummary]:
     return endpoints
 
 
+# ─── Public entry point ───────────────────────────────────────────────────────
+
 async def load_spec(
     url: str,
     http_client: httpx.AsyncClient,
     environment: Environment | None = None,
 ) -> LoadedSpec:
     headers: dict[str, str] = {}
-
     if environment is not None:
         auth = environment.auth
         if auth.type == "bearer" and auth.token:
             headers["Authorization"] = f"{auth.bearer_prefix} {auth.token}"
         elif auth.type == "api_key" and auth.token:
-            key_header = auth.header_name or "X-API-Key"
-            headers[key_header] = auth.token
+            headers[auth.header_name or "X-API-Key"] = auth.token
 
     try:
-        resp = await http_client.get(
-            url,
-            headers=headers,
-            follow_redirects=True,
-        )
+        resp = await http_client.get(url, headers=headers, follow_redirects=True)
         resp.raise_for_status()
     except httpx.TimeoutException as exc:
         raise SpecFetchError(f"Timeout fetching spec from {url}") from exc
@@ -133,45 +260,42 @@ async def load_spec(
         raise SpecFetchError(f"Failed to fetch spec from {url}: {exc}") from exc
 
     content_type = resp.headers.get("content-type", "")
-    raw_text = resp.text
-
-    # Detect YAML vs JSON
     is_yaml = (
         "yaml" in content_type
         or url.endswith(".yaml")
         or url.endswith(".yml")
     )
-
     try:
-        if is_yaml:
-            spec = yaml.safe_load(raw_text)
-        else:
+        spec = yaml.safe_load(resp.text) if is_yaml else json.loads(resp.text)
+        if not isinstance(spec, dict):
             try:
-                spec = json.loads(raw_text)
-            except json.JSONDecodeError:
-                spec = yaml.safe_load(raw_text)
+                spec = yaml.safe_load(resp.text)
+            except Exception:
+                pass
     except Exception as exc:
         raise SpecParseError(f"Failed to parse spec: {exc}") from exc
 
     if not isinstance(spec, dict):
         raise SpecParseError("Parsed spec is not a mapping")
-
     if "openapi" not in spec and "swagger" not in spec:
-        raise SpecParseError("Not a valid OpenAPI/Swagger spec (missing 'openapi' or 'swagger' key)")
+        raise SpecParseError(
+            "Not a valid OpenAPI/Swagger spec (missing 'openapi' or 'swagger' key)"
+        )
+
+    # Resolve external path-item $refs (e.g. Morpheus modular spec)
+    await _resolve_external_path_items(spec, url, http_client)
 
     info = spec.get("info", {})
     title = info.get("title", "Untitled")
     version = info.get("version", "unknown")
     description = info.get("description")
 
-    # Extract base URL
     base_url: str | None = None
     if "servers" in spec and spec["servers"]:
         base_url = spec["servers"][0].get("url")
     elif "host" in spec:
         scheme = spec.get("schemes", ["https"])[0]
-        base_path = spec.get("basePath", "")
-        base_url = f"{scheme}://{spec['host']}{base_path}"
+        base_url = f"{scheme}://{spec['host']}{spec.get('basePath', '')}"
 
     endpoints = _flatten_endpoints(spec)
 

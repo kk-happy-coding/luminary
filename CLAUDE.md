@@ -33,7 +33,7 @@ podman-compose exec api ruff check app/ --fix           # Auto-fix lint issues
 ## Architecture
 
 ```
-luminary/   (directory: myproject/)
+luminary/
 ├── app/
 │   └── main.py          # FastAPI app instance and routes
 ├── tests/

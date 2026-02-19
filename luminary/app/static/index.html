@@ -1198,7 +1198,7 @@ function renderEpRow(ep) {
   const active = STATE.activeEndpoint &&
     STATE.activeEndpoint.method === ep.method && STATE.activeEndpoint.path === ep.path;
   return `<div class="ep-row ${active?'active':''}"
-    onclick="selectEndpoint(${JSON.stringify(ep.method)}, ${JSON.stringify(ep.path)})">
+    onclick='selectEndpoint(${JSON.stringify(ep.method)}, ${JSON.stringify(ep.path)})'>
     <span class="method-badge ${mc}">${esc(ep.method)}</span>
     <span class="ep-path" title="${esc(ep.path)}">${esc(ep.path)}</span>
   </div>`;

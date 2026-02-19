@@ -1172,7 +1172,7 @@ function renderSidebar() {
 
   const renderGroup = (name, eps) => {
     const gid = 'tg-' + name.replace(/\W/g, '-');
-    html += `<div class="tag-group" id="${gid}">
+    html += `<div class="tag-group collapsed" id="${gid}">
       <div class="tag-header" onclick="toggleGroup('${gid}')">
         <span>${esc(name.toUpperCase())}</span>
         <span class="tag-chevron">▾</span>
